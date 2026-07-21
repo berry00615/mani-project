@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+
+videos/*
+!videos/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+logs/*
+!logs/.gitkeep

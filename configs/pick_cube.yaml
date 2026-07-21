@@ -1,0 +1,6 @@
+env_id: PickCube-v1
+obs_mode: state
+render_mode: human
+sim_backend: cpu
+seed: 0
+max_steps: 1000

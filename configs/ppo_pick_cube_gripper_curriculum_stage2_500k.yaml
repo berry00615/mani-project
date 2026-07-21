@@ -1,0 +1,60 @@
+# Stage 2 curriculum config for PickCubeGripperCurriculum-v1
+# Resumes from Stage 1 checkpoint with relaxed gripper open distance.
+#
+# Stage 1 (0.10m): policy learned to approach the cube (tcp_dist 0.290→0.146)
+# Stage 2 (0.15m): policy gets more gripper control opportunities to
+#   breakthrough the grasp phase.  Gripper is forced open only when
+#   farther than 0.15m (was 0.10m), allowing the policy to attempt
+#   closing the gripper earlier during approach.
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=0 python scripts/train_ppo_gpu.py \
+#       --config configs/ppo_pick_cube_gripper_curriculum_stage2_500k.yaml \
+#       --resume checkpoints/ppo_pick_cube_gripper_curriculum_masked_500k/final_seed0_nenvs256.pt \
+#       --run-name seed0_nenvs256_stage2
+
+env_id: PickCubeGripperCurriculum-v1
+obs_mode: state
+render_mode: null
+render_backend: none
+sim_backend: auto
+num_envs: 256
+seed: 0
+enable_shadow: false
+env_kwargs:
+  table_collision_penalty_coef: 0.01
+  table_collision_force_threshold: 1.0
+  table_collision_penalty_max: 0.5
+  early_gripper_close_penalty_coef: 0.05
+  gripper_open_near_cube_bonus: 0.05
+  gripper_near_distance: 0.08
+  gripper_far_distance: 0.15
+  gripper_open_threshold: 0.03
+  gripper_closed_threshold: 0.01
+  force_gripper_open_enabled: true
+  force_gripper_open_until_distance: 0.15  # ← relaxed from 0.10 → 0.15
+total_timesteps: 500000
+learning_rate: 0.0001
+n_steps: 64
+batch_size: 64
+n_epochs: 4
+gamma: 0.99
+gae_lambda: 0.95
+clip_range: 0.1
+ent_coef: 0.0
+vf_coef: 0.5
+max_grad_norm: 0.5
+policy_hidden_sizes:
+- 256
+- 256
+- 256
+value_hidden_sizes:
+- 256
+- 256
+- 256
+checkpoint_interval: 10000
+output_dir: checkpoints/ppo_pick_cube_gripper_curriculum_stage2_500k
+log_dir: logs/ppo_pick_cube_gripper_curriculum_stage2_500k
+eval_interval: 10000
+eval_episodes: 10
+device: cuda

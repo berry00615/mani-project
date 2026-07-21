@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""
+Evaluate a trained PPO policy on PickCube-v1 in headless mode.
+
+Usage:
+    CUDA_VISIBLE_DEVICES=0 python scripts/evaluate_ppo_headless.py \
+        --checkpoint checkpoints/ppo_pick_cube/final.pt \
+        --episodes 10
+"""
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import gymnasium as gym
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from ppo import ActorCritic, load_checkpoint
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate PPO policy headless")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to checkpoint .pt file")
+    parser.add_argument("--episodes", type=int, default=10,
+                        help="Number of evaluation episodes")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Evaluation seed (different from training)")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Device (cuda/cpu). Default: auto-detect.")
+    return parser.parse_args()
+
+
+def evaluate():
+    args = parse_args()
+
+    ckpt_path = Path(args.checkpoint)
+    if not ckpt_path.exists():
+        print(f"ERROR: Checkpoint not found: {ckpt_path}")
+        sys.exit(1)
+
+    # --- Device ---
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("=" * 70)
+    print("Headless PPO Evaluation")
+    print("=" * 70)
+    print(f"  Checkpoint:    {ckpt_path}")
+    print(f"  Episodes:      {args.episodes}")
+    print(f"  Seed:          {args.seed}")
+    print(f"  Device:        {device}")
+
+    # --- Load checkpoint ---
+    print("\nLoading checkpoint...")
+    map_loc = "cuda:0" if device.type == "cuda" else "cpu"
+    ckpt = load_checkpoint(str(ckpt_path), map_location=map_loc, device=device)
+
+    env_id = ckpt["env_id"]
+    obs_mode = ckpt["obs_mode"]
+    control_mode = ckpt["control_mode"]
+    arch = ckpt["architecture"]
+    config = ckpt.get("config", {})
+    timestep = ckpt["timestep"]
+    versions = ckpt.get("versions", {})
+
+    print(f"  Env ID:        {env_id}")
+    print(f"  Obs mode:       {obs_mode}")
+    print(f"  Control mode:   {control_mode}")
+    print(f"  Timestep:       {timestep}")
+    print(f"  ManiSkill ver:  {versions.get('mani_skill', 'unknown')}")
+
+    # --- Create environment (headless, no Vulkan) ---
+    print("\nCreating environment...")
+    import mani_skill.envs  # registers ManiSkill environments
+    env = gym.make(
+        env_id,
+        num_envs=1,
+        obs_mode=obs_mode,
+        render_mode=None,
+        sim_backend="auto",
+        render_backend="none",       # CRITICAL: no Vulkan
+        enable_shadow=False,
+    )
+    print(f"  Obs space:      {env.observation_space.shape}")
+    print(f"  Act space:      {env.action_space.shape}")
+    print(f"  Control mode:   {env.unwrapped.control_mode}")
+    print(f"  Sim backend:    {env.unwrapped.backend.sim_backend}")
+    print(f"  Can render:     {env.unwrapped.scene.can_render()}")
+
+    # --- Build policy ---
+    action_low = arch.get("action_low", None)
+    action_high = arch.get("action_high", None)
+    if action_low is not None and not isinstance(action_low, np.ndarray):
+        action_low = np.array(action_low)
+    if action_high is not None and not isinstance(action_high, np.ndarray):
+        action_high = np.array(action_high)
+
+    policy = ActorCritic(
+        obs_dim=arch["obs_dim"],
+        act_dim=arch["act_dim"],
+        policy_hidden_sizes=arch["policy_hidden_sizes"],
+        value_hidden_sizes=arch["value_hidden_sizes"],
+        action_low=action_low,
+        action_high=action_high,
+    ).to(device)
+    policy.load_state_dict(ckpt["policy_state_dict"])
+    policy.eval()
+    print(f"  Policy loaded successfully.")
+
+    # --- Evaluate ---
+    print(f"\n{'=' * 70}")
+    print(f"Running {args.episodes} episodes...")
+    print(f"{'=' * 70}")
+
+    episode_rewards = []
+    episode_lengths = []
+    successes = []
+
+    t_start = time.time()
+
+    for ep in range(args.episodes):
+        seed = args.seed + ep
+        obs, _ = env.reset(seed=seed)
+
+        if isinstance(obs, np.ndarray):
+            obs = torch.from_numpy(obs).float().to(device)
+        elif obs.device != device:
+            obs = obs.to(device)
+
+        ep_reward = 0.0
+        ep_length = 0
+        done = False
+
+        while not done:
+            with torch.no_grad():
+                action, _, _ = policy.get_action(obs, deterministic=True)
+
+            action_np = action.cpu().numpy()
+            obs, reward, terminated, truncated, info = env.step(action_np)
+
+            done = bool(terminated or truncated)
+            r = float(reward.item() if hasattr(reward, 'item') else reward)
+            ep_reward += r
+            ep_length += 1
+
+            if isinstance(obs, np.ndarray):
+                obs = torch.from_numpy(obs).float().to(device)
+            elif obs.device != device:
+                obs = obs.to(device)
+
+            if done:
+                # Check success from info
+                # PickCube-v1 info has: 'success', 'is_obj_placed', 'is_robot_static', 'is_grasped', 'elapsed_steps'
+                success = bool(info.get("success", False))
+                if isinstance(success, (np.ndarray, torch.Tensor)):
+                    success = bool(success.item() if hasattr(success, 'item') else success)
+                successes.append(success)
+                episode_rewards.append(ep_reward)
+                episode_lengths.append(ep_length)
+                print(f"  Ep {ep+1:3d}: reward={ep_reward:>7.3f}, length={ep_length:>4d}, success={success}")
+                break
+
+    total_time = time.time() - t_start
+
+    # --- Summary ---
+    rewards = np.array(episode_rewards)
+    lengths = np.array(episode_lengths)
+    success_rate = np.mean(successes) * 100 if successes else 0.0
+
+    print(f"\n{'=' * 70}")
+    print(f"Evaluation Results")
+    print(f"{'=' * 70}")
+    print(f"  Episodes:           {len(rewards)}")
+    print(f"  Mean reward:        {rewards.mean():.3f}")
+    print(f"  Reward std:         {rewards.std():.3f}")
+    print(f"  Mean episode length:{lengths.mean():.1f}")
+    print(f"  Success rate:       {success_rate:.1f}% ({sum(successes)}/{len(successes)})")
+    print(f"  Total time:         {total_time:.1f}s")
+    print(f"  Time per episode:   {total_time / len(rewards):.1f}s")
+
+    env.close()
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    evaluate()
