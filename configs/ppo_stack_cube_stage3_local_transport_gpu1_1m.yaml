@@ -1,0 +1,39 @@
+# SC-S3: local-target transport curriculum, branched from SC-S1 final.
+env_id: StackCubeLocalTransportCurriculum-v1
+obs_mode: state
+render_mode: null
+render_backend: none
+sim_backend: auto
+num_envs: 256
+seed: 0
+enable_shadow: false
+env_kwargs:
+  target_distance_min: 0.07
+  target_distance_max: 0.11
+  transport_progress_scale: 300.0
+  best_improvement_scale: 150.0
+  transport_progress_clip: 0.02
+  drop_penalty: 8.0
+  premature_release_penalty: 5.0
+  on_target_bonus: 10.0
+  success_bonus: 100.0
+  time_penalty: 0.01
+total_timesteps: 1000000
+learning_rate: 0.0001
+n_steps: 64
+batch_size: 1024
+n_epochs: 4
+gamma: 0.99
+gae_lambda: 0.95
+clip_range: 0.15
+ent_coef: 0.0
+vf_coef: 0.5
+max_grad_norm: 0.5
+policy_hidden_sizes: [256, 256, 256]
+value_hidden_sizes: [256, 256, 256]
+checkpoint_interval: 50000
+output_dir: checkpoints/ppo_stack_cube_stage3_local_transport_gpu1_1m
+log_dir: logs/ppo_stack_cube_stage3_local_transport_gpu1_1m
+eval_interval: 50000
+eval_episodes: 20
+device: cuda

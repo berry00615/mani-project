@@ -1,0 +1,106 @@
+project: mani-project
+updated: 2026-07-26
+timezone: Asia/Shanghai
+status: four_tasks_complete_semi_closed
+
+workspace:
+  local: /Users/michaelh/projects/mani-project
+  server_host: 115.190.90.101
+  server_port: 39232
+  server_user: root
+  server_project: /vepfs-mlp2/queue013/public/huangborui/mani-project
+  python_custom: /vepfs-mlp2/queue013/public/huangborui/envs/robotics/bin/python
+  python_official: /vepfs-mlp2/queue013/public/huangborui/envs/stackcube_official/bin/python
+  official_maniskill_source: third_party/ManiSkill-v3.0.1-official
+  official_commit: a4a4f9272ad64b1564035874b605ceb687b63ed8
+
+constraints:
+  server_only_writable_root: /vepfs-mlp2/queue013/public/huangborui
+  server_paths_outside_writable_root: strictly_read_only
+  verify_server_write_target_is_within_writable_root: true
+  gpu_count: 2
+  default_physical_gpu: 1
+  default_cuda_visible_devices: "1"
+  multi_gpu_allowed_when_beneficial: true
+  multi_gpu_preconditions:
+    - verify_both_gpus_are_free
+    - do_not_interfere_with_existing_processes
+    - use_real_multi_gpu_implementation
+    - record_allocation_and_launch_topology
+  monitor_interval_seconds: 180
+  destructive_changes: forbidden
+  overwrite_existing_artifacts: forbidden
+  backup_before_modifying_established_artifact: true
+
+tasks:
+  pick_cube:
+    status: complete
+    stage: "6.9"
+    best_model_local: checkpoints/ppo_pick_cube_final_precision_stage6.9_gpu1_300k/best_seed0_nenvs256_stage6.9_90of100.pt
+    best_model_server: checkpoints/ppo_pick_cube_final_precision_stage6.9_gpu1_300k/best_seed0_nenvs256_stage6.9_90of100.pt
+    sha256: 35d61a031d20dcba73ef9fe60be9398ddb0a8bd83c6eb81889c2df852a0fdbad
+    fixed_seed_result: 90/100
+    videos: videos/stage6.9_best_20_successes
+    report: docs/mani_project_full_research_report_stage6_9.docx
+    handoff: tasks/pick_cube/README.md
+
+  stack_cube:
+    status: complete
+    stage: SC-O2
+    best_model_local: checkpoints/ppo_stack_cube_official_ckpt726_lr1e4_10m/best_official_ckpt726_lr1e4_10m_894of1000_matchedseed.pt
+    best_model_server: runs/ppo-StackCube-v1-state-seed0-official_ckpt726_lr1e4_10m_20260722/best_official_ckpt726_lr1e4_10m_894of1000_matchedseed.pt
+    sha256: 4b42502f287c62a0eddbc3f2c61924bcb226f4838ddd14ba76038143a87c2edc
+    selection_result: 183/200
+    formal_matched_seed: 20260722
+    formal_matched_result: 894/1000
+    formal_additional_seed: 0
+    formal_additional_result: 920/1000
+    videos: videos/stackcube_best_sc_o2_894of1000
+    final_report: docs/stack_cube_final_report_zh.md
+    experiment_log: docs/stack_cube_experiment_log.md
+    handoff: tasks/stack_cube/README.md
+
+  peg_insertion_side:
+    status: complete
+    stage: PIS-O2
+    environment: PegInsertionSide-v1
+    best_model_local: checkpoints/ppo_peg_insertion_side_official_ckpt2151_lr1e4_25m/best_o2_ckpt551_991of1000_matchedseed.pt
+    best_model_server: runs/ppo-PegInsertionSide-v1-state-seed0-official_ckpt2151_lr1e4_25m_20260723/best_o2_ckpt551_991of1000_matchedseed.pt
+    sha256: b48a4e0732de5e1e68bc906897166be95f2cecb3a4c8d245680dc62e2e7a6c49
+    selection_seed: 0
+    selection_result: 99/100
+    independent_seed: 10000
+    independent_result: 100/100
+    formal_matched_seed: 20260722
+    formal_matched_result: 991/1000
+    previous_best_formal_result: 175/1000
+    videos: videos/peg_insertion_side
+    final_report: docs/peg_insertion_side_final_report_zh.docx
+    experiment_log: docs/peg_insertion_side_experiment_log.md
+    handoff: tasks/peg_insertion_side/README.md
+
+  two_robot_pick_cube:
+    status: complete
+    stage: TRPC-O5
+    environment: TwoRobotPickCube-v1
+    best_model_local: checkpoints/ppo_two_robot_pick_cube_o5_lr5e5_10m/best_o5_final_1000of1000_matchedseed.pt
+    best_model_server: runs/two_robot_pick_cube_TRPC-O5_o3ckpt476_lr5e5_10m_seed0_20260723/best_o5_final_1000of1000_matchedseed.pt
+    sha256: ebe5d6865c4d7282f428931258144ac73ec37add7b94c9578de3e8448d1aa63c
+    selection_seed: 0
+    selection_result: 100/100
+    independent_seed: 10000
+    independent_result: 100/100
+    formal_matched_seed: 20260723
+    formal_matched_result: 1000/1000
+    videos: videos/two_robot_pick_cube/o5_best_20_successes_20260724
+    final_report: docs/two_robot_pick_cube_final_report_zh.docx
+    experiment_log: docs/two_robot_pick_cube_experiment_log.md
+    handoff: tasks/two_robot_pick_cube/README.md
+
+maintenance_startup:
+  - Read AGENTS.md and all files listed at its top.
+  - Confirm server connectivity and physical GPU 1 availability.
+  - Restrict work to adjustments, verification, and archival of existing tasks.
+  - Do not start a new task unless the project owner explicitly reopens expansion.
+  - Use a unique run and output directory for every maintenance experiment.
+  - Record every maintenance experiment, including rejected adjustments.

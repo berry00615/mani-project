@@ -2,6 +2,17 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-*/
+backups/
+*.bak
+*.bak_*
+*.backup_*
+*.stage*_remote
+render_fixed.py
+
+# Local/editor and generated report environments
+.pytest_cache/
+.mypy_cache/
 
 videos/*
 !videos/.gitkeep
@@ -9,3 +20,4 @@ checkpoints/*
 !checkpoints/.gitkeep
 logs/*
 !logs/.gitkeep
+runs/

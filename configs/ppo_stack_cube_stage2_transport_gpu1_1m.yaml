@@ -1,0 +1,36 @@
+# SC-S2: resume SC-S1 and solve grasped transport/alignment plateau.
+env_id: StackCubeTransportCurriculum-v1
+obs_mode: state
+render_mode: null
+render_backend: none
+sim_backend: auto
+num_envs: 256
+seed: 0
+enable_shadow: false
+env_kwargs:
+  transport_progress_scale: 120.0
+  transport_progress_clip: 0.02
+  goal_reward_scale: 4.0
+  drop_penalty: 4.0
+  success_bonus: 50.0
+  time_penalty: 0.01
+
+total_timesteps: 1000000
+learning_rate: 0.0001
+n_steps: 64
+batch_size: 1024
+n_epochs: 4
+gamma: 0.99
+gae_lambda: 0.95
+clip_range: 0.15
+ent_coef: 0.0
+vf_coef: 0.5
+max_grad_norm: 0.5
+policy_hidden_sizes: [256, 256, 256]
+value_hidden_sizes: [256, 256, 256]
+checkpoint_interval: 50000
+output_dir: checkpoints/ppo_stack_cube_stage2_transport_gpu1_1m
+log_dir: logs/ppo_stack_cube_stage2_transport_gpu1_1m
+eval_interval: 50000
+eval_episodes: 20
+device: cuda

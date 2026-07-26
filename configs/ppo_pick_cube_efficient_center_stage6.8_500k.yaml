@@ -1,0 +1,277 @@
+# Stage 6.8 efficient center carry curriculum
+# Resumes from Stage 6.7 final checkpoint with:
+#   - Reduced center reward (1.5x, was 8.0x) — small local shaping only
+#   - Strengthened progress reward (400x, was 300x)
+#   - Best-so-far improvement reward (200x, only on new best distance)
+#   - Tiered near-goal stall penalties (3 zones, escalating)
+#   - Away-from-goal penalty (200x on backward motion)
+#   - Small per-step time cost (0.02/step)
+#   - Success efficiency reward (80 + 70*remaining_frac, was 50+30)
+#   - Timeout terminal penalty (-60 one-time)
+#
+# Stage 1-2: approach + grasp
+# Stage 3:   transport attempt (failed)
+# Stage 4:   lift focused
+# Stage 4.5: stable grasp
+# Stage 5:   three-phase target transport
+# Stage 5.5: directed smooth transport
+# Stage 6:   goal-zone brake (grasp 78.2%, transport 75.4%, success 6/4867)
+# Stage 6.5: precision carry + natural pose (grasp 81.3%, transport 78.4%, success 18/4868)
+# Stage 6.6: posture-stable carry (grasp 85.2%, success 25.49%)
+# Stage 6.7: center-precision carry (grasp 84.2%, success 60.41%)
+# Stage 6.8: efficient center carry (this config)
+#
+# Key changes from Stage 6.7:
+#   - center_reward_scale: 8.0 → 1.5 (reduced 5.3x, no longer farmable)
+#   - center_progress_reward_scale: 300 → 400 (strengthened 1.33x)
+#   - New: best_improvement_reward (200 * clamp(old_best-curr, 0, 0.01))
+#   - New: tiered stall penalties (3 zones with escalating severity)
+#   - New: away_from_goal_penalty (200 * clamp(-progress, 0, 0.005))
+#   - New: time_penalty_per_step (0.02)
+#   - base_success_reward: 50 → 80, fast_success_bonus: 30 → 70
+#   - New: timeout_penalty (-60 for truncated failures)
+#   - Old center_reward becomes center_reward_small (diagnostic only)
+#
+# Reward inversion fix (Stage 6.7 residual problem):
+#   - Stage 6.7: center_reward at 2.7cm = 2.72/step × 100 steps ≈ 272 reward
+#     from farming alone. Success terminal (50+30*remaining) couldn't compete.
+#   - Stage 6.8: center_reward at 2.7cm = 0.51/step × 100 steps ≈ 51 reward.
+#     Tiered stall penalties deduct 0.50/step at 2.5-3cm, offsetting farming.
+#     Timeout penalty (-60) makes failure total negative.
+#     Success efficiency (80+70*remaining) = 80-141, strictly dominant.
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=0 python scripts/train_ppo_gpu.py \
+#       --config configs/ppo_pick_cube_efficient_center_stage6.8_500k.yaml \
+#       --resume checkpoints/ppo_pick_cube_center_precision_stage6.7_500k/final_seed0_nenvs256_stage6.7.pt \
+#       --run-name seed0_nenvs256_stage6.8
+
+env_id: PickCubeEfficientCenterCarry-v1
+obs_mode: state
+render_mode: null
+render_backend: none
+sim_backend: auto
+num_envs: 256
+seed: 0
+enable_shadow: false
+env_kwargs:
+  # Collision
+  table_collision_penalty_coef: 0.01
+  table_collision_force_threshold: 1.0
+  table_collision_penalty_max: 0.5
+  # Gripper timing
+  early_gripper_close_penalty_coef: 0.05
+  gripper_open_near_cube_bonus: 0.05
+  gripper_near_distance: 0.08
+  gripper_far_distance: 0.15
+  gripper_open_threshold: 0.03
+  gripper_closed_threshold: 0.01
+  # Action masking
+  force_gripper_open_enabled: true
+  force_gripper_open_until_distance: 0.15
+  # Stage 4 lift (unchanged)
+  min_hold_reward: 0.02
+  lift_reward_coef: 15.0
+  lift_reward_max: 1.5
+  lift_1cm_bonus: 0.5
+  lift_3cm_bonus: 1.5
+  lift_5cm_bonus: 3.0
+  drop_penalty: 1.0
+  approach_reward_grasped_scale: 0.0
+  # Stage 4.5 stable grasp (unchanged)
+  stable_grasp_steps: 3
+  early_drop_penalty: 0.5
+  early_drop_max_steps: 5
+  min_initial_goal_distance: 0.10
+  # Stage 5 transport base (unchanged)
+  transport_min_lift_height: 0.02
+  target_distance_scale: 5.0
+  target_distance_reward_coef: 0.0             # ZEROED: replaced by center_reward_small
+  # Stage 5.5 directed transport (unchanged except far_progress)
+  target_progress_reward_coef: 15.0
+  target_progress_clip: 0.05
+  direction_reward_coef: 5.0
+  wrong_way_penalty_coef: 8.0
+  direction_velocity_clip: 0.5
+  action_smoothness_coef: 0.01
+  lateral_motion_penalty_coef: 1.0
+  stagnation_progress_threshold: 0.001
+  stagnation_steps_threshold: 5
+  stagnation_penalty_coef: 0.05
+  transport_safe_height_reward_coef: 0.1
+  transport_height_drop_penalty_coef: 5.0
+  transport_drop_penalty: 3.0
+  transport_lift_reward_scale: 0.02
+  best_distance_bonus_coef: 2.0
+  best_distance_improvement_clip: 0.05
+  near_goal_direction_scale: 0.3
+  near_goal_stagnation_scale: 0.2
+  # Stage 5 bonuses
+  near_goal_threshold: 0.05
+  near_goal_bonus: 1.0
+  placed_bonus: 2.0
+  success_reward_bonus: 0.0                   # ZEROED: replaced by success_efficiency_reward
+  # Stage 6: zone thresholds
+  brake_zone_outer: 0.08
+  placed_control_enter_threshold: 0.025
+  placed_control_exit_threshold: 0.032
+  # Stage 6: far zone coefficients
+  far_progress_reward_coef: 0.0                # ZEROED: replaced by center_progress_reward
+  far_direction_reward_coef: 5.0
+  far_wrong_way_penalty_coef: 8.0
+  # Stage 6: placed zone
+  placed_cube_speed_penalty_coef: 8.0
+  placed_static_reward_coef: 2.0
+  static_shaping_scale: 5.0
+  placed_hold_reward_coef: 0.5
+  placed_center_reward_coef: 1.0
+  placed_exit_penalty_coef: 5.0
+  placed_action_magnitude_coef: 0.05
+  # Stage 6: dwell bonuses
+  placed_dwell_3_bonus: 0.5
+  placed_dwell_5_bonus: 1.0
+  placed_dwell_10_bonus: 2.0
+  placed_dwell_cube_speed_threshold: 0.05
+  placed_dwell_robot_qvel_threshold: 0.4
+  # Stage 6: clipping
+  cube_speed_clip: 0.5
+  robot_qvel_clip: 1.0
+  # Stage 6: far action smoothness
+  far_action_smoothness_coef: 0.01
+  near_action_smoothness_coef: 0.02
+  # Stage 6: brake zone (disabled)
+  approach_cube_speed_penalty_coef: 0.0
+  near_robot_motion_penalty_coef: 0.0
+  # Stage 6.5: target speed band
+  speed_band_max: 0.15
+  speed_band_sigma: 0.05
+  speed_band_reward_coef: 1.0
+  # Stage 6.5: premature stop
+  stop_velocity_threshold: 0.005
+  premature_stop_steps_threshold: 3
+  premature_stop_coef: 0.3
+  # Stage 6.5: min progress
+  min_progress_scale: 0.05
+  # Stage 6.5: precision distance
+  precision_dist_coef: 0.3
+  # Stage 6.5: near-goal motion
+  near_motion_shaping_coef: 0.3
+  near_motion_tanh_scale: 3.0
+  # Stage 6.5: pose constraints
+  rel_pos_error_coef: 0.3
+  rel_rot_error_coef: 0.5
+  upright_penalty_coef: 0.1
+  # Stage 6.5: clearance
+  min_cube_clearance: 0.01
+  cube_clearance_coef: 2.0
+  min_tcp_cube_offset: 0.02
+  tcp_height_penalty_coef: 1.0
+  # Stage 6.5: dragging
+  drag_clearance_threshold: 0.005
+  drag_speed_threshold: 0.05
+  drag_penalty_coef: 2.0
+  # ---------------------------------------------------------------
+  # Stage 6.6: near-goal action scaling (RELAXED for Stage 6.7)
+  # ---------------------------------------------------------------
+  action_scale_far_dist: 0.12
+  action_scale_near_dist: 0.04
+  arm_delta_scale_min: 0.35                   # RELAXED from 0.25
+  wrist_delta_scale_min: 0.10                 # RELAXED from 0.08
+  # ---------------------------------------------------------------
+  # Stage 6.6: joint limit (unchanged)
+  # ---------------------------------------------------------------
+  joint_limit_margin: 0.70
+  joint_limit_penalty_coef: 0.3
+  wrist_joint_weight: 2.0
+  # ---------------------------------------------------------------
+  # Stage 6.6: posture regularization (unchanged)
+  # ---------------------------------------------------------------
+  posture_reg_coef: 0.05
+  posture_near_goal_boost: 3.0
+  posture_far_scale: 0.2
+  # ---------------------------------------------------------------
+  # Stage 6.6: near-goal speed penalties (unchanged)
+  # ---------------------------------------------------------------
+  near_goal_cube_speed_coef: 0.5
+  near_goal_tcp_speed_coef: 0.3
+  near_goal_qvel_coef: 0.2
+  # ---------------------------------------------------------------
+  # Stage 6.6: goal dwell (unchanged)
+  # ---------------------------------------------------------------
+  goal_dwell_cube_speed_threshold: 0.03
+  goal_dwell_robot_qvel_threshold: 0.3
+  goal_dwell_3_bonus: 1.0
+  goal_dwell_5_bonus: 2.0
+  goal_dwell_10_bonus: 5.0
+  # ---------------------------------------------------------------
+  # Stage 6.6: goal exit (unchanged)
+  # ---------------------------------------------------------------
+  goal_exit_penalty_coef: 8.0
+  # ---------------------------------------------------------------
+  # Stage 6.7 center precision (overridden by Stage 6.8)
+  # ---------------------------------------------------------------
+  center_reward_scale: 1.0                     # REDUCED from 8.0 → 1.5 → 1.0
+  center_reward_sigma: 0.025
+  center_reward_time_decay: true              # NEW: × remaining_fraction (clamped to 0.1)
+  center_progress_reward_scale: 400.0          # STRENGTHENED from 300.0
+  center_progress_clip_min: -0.01
+  center_progress_clip_max: 0.01
+  near_goal_stall_distance: 0.05
+  near_goal_stall_progress_threshold: 0.0005
+  near_goal_stall_steps_threshold: 3
+  near_goal_stall_penalty_coef: 0.15
+  base_success_reward: 100.0                   # STRENGTHENED from 80.0
+  fast_success_bonus: 120.0                    # STRENGTHENED from 70.0
+  # ---------------------------------------------------------------
+  # Stage 6.8: best-so-far improvement
+  # ---------------------------------------------------------------
+  best_improvement_scale: 200.0
+  best_improvement_max: 0.01
+  # ---------------------------------------------------------------
+  # Stage 6.8: tiered stall penalties
+  # ---------------------------------------------------------------
+  tiered_stall_35_50_threshold: 5
+  tiered_stall_35_50_penalty: 0.10
+  tiered_stall_30_35_threshold: 3
+  tiered_stall_30_35_penalty: 0.25
+  tiered_stall_25_30_threshold: 2
+  tiered_stall_25_30_penalty: 0.50
+  # ---------------------------------------------------------------
+  # Stage 6.8: away-from-goal penalty
+  # ---------------------------------------------------------------
+  away_from_goal_penalty_scale: 200.0
+  away_from_goal_clip: 0.005
+  # ---------------------------------------------------------------
+  # Stage 6.8: time penalty
+  # ---------------------------------------------------------------
+  time_penalty_per_step: 0.08                  # INCREASED from 0.02
+  # ---------------------------------------------------------------
+  # Stage 6.8: timeout penalty
+  # ---------------------------------------------------------------
+  timeout_penalty_value: 100.0                 # INCREASED from 60.0
+total_timesteps: 500000
+learning_rate: 0.00005
+n_steps: 64
+batch_size: 64
+n_epochs: 4
+gamma: 0.99
+gae_lambda: 0.95
+clip_range: 0.1
+ent_coef: 0.0
+vf_coef: 0.5
+max_grad_norm: 0.5
+policy_hidden_sizes:
+- 256
+- 256
+- 256
+value_hidden_sizes:
+- 256
+- 256
+- 256
+checkpoint_interval: 10000
+output_dir: checkpoints/ppo_pick_cube_efficient_center_stage6.8_500k
+log_dir: logs/ppo_pick_cube_efficient_center_stage6.8_500k
+eval_interval: 10000
+eval_episodes: 10
+device: cuda
+
