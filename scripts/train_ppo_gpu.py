@@ -459,7 +459,13 @@ def train(args):
     # Restore optimizer state after PPO creation
     if args.resume is not None and ckpt_optimizer_state is not None:
         ppo_algo.optimizer.load_state_dict(ckpt_optimizer_state)
-        print(f"    Optimizer state restored")
+        # Optimizer checkpoints include param-group hyperparameters. Without
+        # resetting them here, a fine-tune YAML learning_rate is silently
+        # replaced by the previous run's value.
+        configured_lr = float(config.get("learning_rate", 3e-4))
+        for param_group in ppo_algo.optimizer.param_groups:
+            param_group["lr"] = configured_lr
+        print(f"    Optimizer state restored (learning_rate={configured_lr:g})")
 
     # ---- Create buffer ----
     n_steps = config.get("n_steps", 2048)
@@ -482,10 +488,25 @@ def train(args):
     # ---- Logging setup ----
     output_dir = PROJECT_ROOT / config.get("output_dir", "checkpoints/ppo_pick_cube_collision_gripper_gpu")
     log_dir = PROJECT_ROOT / config.get("log_dir", "logs/ppo_pick_cube_collision_gripper_gpu")
+    csv_log_path = log_dir / f"training_{run_name}.csv"
+    final_path = output_dir / f"final_{run_name}.pt"
+
+    # Completed experiment artifacts are immutable. Refuse a repeated
+    # output/run combination before creating or truncating any file.
+    conflicts = [path for path in (csv_log_path, final_path) if path.exists()]
+    if output_dir.exists():
+        conflicts.extend(sorted(output_dir.glob("checkpoint_*.pt")))
+    if conflicts:
+        conflict_list = "\n".join(f"    {path}" for path in conflicts[:10])
+        if len(conflicts) > 10:
+            conflict_list += f"\n    ... and {len(conflicts) - 10} more"
+        raise FileExistsError(
+            "refusing to reuse an existing experiment output; choose a new "
+            f"output_dir/log_dir/run_name:\n{conflict_list}"
+        )
+
     output_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
-
-    csv_log_path = log_dir / f"training_{run_name}.csv"
     save_csv_log(str(csv_log_path), {}, header=True)
 
     checkpoint_interval = config.get("checkpoint_interval", 10000)
@@ -655,6 +676,9 @@ def train(args):
 
                 # Grasp tracking (from info dict)
                 is_grasped = info.get("is_grasped", None)
+                if is_grasped is None:
+                    # Native StackCube uses a task-specific field name.
+                    is_grasped = info.get("is_cubeA_grasped", None)
                 if is_grasped is not None:
                     grasp_check_count += num_envs
                     grasp_steps_total += int(is_grasped.sum().item())
@@ -1050,7 +1074,6 @@ def train(args):
               f"{final_mem[1]:.0f} MiB reserved")
 
     # Final checkpoint
-    final_path = output_dir / f"final_{run_name}.pt"
     save_checkpoint(
         path=str(final_path),
         policy=policy,

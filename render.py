@@ -1,338 +1,368 @@
-"""Render and record a trained PPO policy for ManiSkill PickCube-v1."""
+#!/usr/bin/env python3
+"""
+Render a trained PPO policy on PickCube environments with the ManiSkill GUI viewer.
+
+Supports:
+  - Interactive rendering (default)
+  - Fixed-seed batch evaluation (--seeds)
+  - Deterministic policy (actor mean, no sampling)
+  - Video recording (--record)
+  - Step-by-step overlay diagnostics
+
+Usage:
+    # Interactive single episode
+    python render.py --checkpoint checkpoints/.../final.pt
+
+    # Fixed seeds, no rendering
+    python render.py --checkpoint checkpoints/.../final.pt \
+        --seeds 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19 \
+        --no-render
+
+    # Video recording
+    python render.py --checkpoint checkpoints/.../final.pt --record
+"""
 
 import argparse
+import os
+import sys
+import time
 from pathlib import Path
-from typing import Any
-import envs  # noqa: F401 - 注册项目自定义环境
-import gymnasium as gym
-import mani_skill.envs  # noqa: F401
+
 import numpy as np
 import torch
-import torch.nn as nn
-from mani_skill.utils.wrappers import RecordEpisode
+import gymnasium as gym
 
-class PPOPolicy(nn.Module):
-    def __init__(
-        self,
-        obs_dim: int,
-        act_dim: int,
-        policy_hidden_sizes: list[int],
-        value_hidden_sizes: list[int],
-        action_low: np.ndarray,
-        action_high: np.ndarray,
-    ) -> None:
-        super().__init__()
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-        policy_layers: list[nn.Module] = []
-        input_dim = obs_dim
+from ppo import ActorCritic, load_checkpoint
 
-        for hidden_dim in policy_hidden_sizes:
-            policy_layers.extend(
-                [
-                    nn.Linear(input_dim, hidden_dim),
-                    nn.Tanh(),
-                ]
-            )
-            input_dim = hidden_dim
 
-        self.features = nn.Sequential(*policy_layers)
-        self.actor_head = nn.Linear(input_dim, act_dim)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-        value_layers: list[nn.Module] = []
-        value_input_dim = input_dim
+def _scalar(v):
+    """Extract Python scalar from tensor/array/primitive."""
+    if v is None:
+        return 0.0
+    if isinstance(v, torch.Tensor):
+        return float(v.item()) if v.numel() == 1 else float(v.flatten()[0].item())
+    if isinstance(v, np.ndarray):
+        return float(v.item()) if v.size == 1 else float(v.flatten()[0])
+    if isinstance(v, bool):
+        return float(v)
+    return float(v)
 
-        for hidden_dim in value_hidden_sizes:
-            value_layers.extend(
-                [
-                    nn.Linear(value_input_dim, hidden_dim),
-                    nn.Tanh(),
-                ]
-            )
-            value_input_dim = hidden_dim
 
-        value_layers.append(nn.Linear(value_input_dim, 1))
-        self.value_net = nn.Sequential(*value_layers)
+def _bool(v):
+    """Extract Python bool from tensor/array/primitive."""
+    if v is None:
+        return False
+    if isinstance(v, torch.Tensor):
+        return bool(v.item()) if v.numel() == 1 else bool(v.flatten()[0].item())
+    if isinstance(v, np.ndarray):
+        return bool(v.item()) if v.size == 1 else bool(v.flatten()[0])
+    return bool(v)
 
-        self.log_std = nn.Parameter(torch.zeros(act_dim))
 
-        self.register_buffer(
-            "action_low",
-            torch.as_tensor(action_low, dtype=torch.float32),
-        )
-        self.register_buffer(
-            "action_high",
-            torch.as_tensor(action_high, dtype=torch.float32),
-        )
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
 
-    @torch.no_grad()
-    def deterministic_action(self, obs: torch.Tensor) -> torch.Tensor:
-        features = self.features(obs)
-        action_mean = self.actor_head(features)
+def load_policy(ckpt_path: str, device: torch.device):
+    """Load checkpoint and build ActorCritic policy."""
+    map_loc = "cuda:0" if device.type == "cuda" else "cpu"
+    ckpt = load_checkpoint(str(ckpt_path), map_location=map_loc, device=device)
 
-        return torch.clamp(
-            action_mean,
-            self.action_low,
-            self.action_high,
-        )
+    arch = ckpt["architecture"]
+    action_low = arch.get("action_low", None)
+    action_high = arch.get("action_high", None)
+    if action_low is not None and not isinstance(action_low, np.ndarray):
+        action_low = np.array(action_low)
+    if action_high is not None and not isinstance(action_high, np.ndarray):
+        action_high = np.array(action_high)
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="渲染已训练的 ManiSkill PPO 模型")
-    parser.add_argument(
-        "--checkpoint",
-        default="checkpoints/ppo_pick_cube/final.pt",
-        help="checkpoint 路径",
+    policy = ActorCritic(
+        obs_dim=arch["obs_dim"],
+        act_dim=arch["act_dim"],
+        policy_hidden_sizes=arch["policy_hidden_sizes"],
+        value_hidden_sizes=arch["value_hidden_sizes"],
+        action_low=action_low,
+        action_high=action_high,
+    ).to(device)
+    policy.load_state_dict(ckpt["policy_state_dict"])
+    policy.eval()
+
+    # Check for obs_rms
+    obs_rms = ckpt.get("obs_rms", None)
+    if obs_rms is not None:
+        print("检测到 obs_rms，将使用归一化观测")
+    else:
+        print("未检测到可用的 obs_rms，将使用原始观测")
+
+    return policy, ckpt
+
+
+def create_env(ckpt: dict, render: bool = True, record: bool = False):
+    """Create environment from checkpoint config."""
+    import mani_skill.envs  # registers ManiSkill environments
+    import envs  # noqa: F401 — registers custom project environments
+
+    env_id = ckpt["env_id"]
+    obs_mode = ckpt["obs_mode"]
+    config = ckpt.get("config", {})
+
+    render_mode = "rgb_array" if record else ("human" if render else None)
+    sim_backend = "auto"
+
+    make_kwargs = dict(
+        num_envs=1,
+        obs_mode=obs_mode,
+        render_mode=render_mode,
+        sim_backend=sim_backend,
+        # Recording also needs an active renderer even when no GUI is shown.
+        render_backend="vulkan" if (render or record) else "none",
+        enable_shadow=False,
     )
-    parser.add_argument(
-        "--episodes",
-        type=int,
-        default=5,
-        help="录制 episode 数量",
-    )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=200,
-        help="每个 episode 最大步数",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="随机种子",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="videos/ppo_pick_cube",
-        help="视频输出目录",
-    )
+    env_kwargs = config.get("env_kwargs", None)
+    if env_kwargs:
+        make_kwargs.update(env_kwargs)
+
+    env = gym.make(env_id, **make_kwargs)
+    return env
+
+
+# ---------------------------------------------------------------------------
+# Single episode
+# ---------------------------------------------------------------------------
+
+def _frame_to_uint8(frame):
+    """Normalize env.render() output to an HxWx3 uint8 numpy array."""
+    if isinstance(frame, torch.Tensor):
+        frame = frame.detach().cpu().numpy()
+    frame = np.asarray(frame)
+    while frame.ndim > 3 and frame.shape[0] == 1:
+        frame = frame[0]
+    if frame.ndim == 4:
+        frame = frame[0]
+    if frame.dtype != np.uint8:
+        if np.issubdtype(frame.dtype, np.floating) and frame.max(initial=0) <= 1.0:
+            frame = frame * 255.0
+        frame = np.clip(frame, 0, 255).astype(np.uint8)
+    if frame.ndim != 3 or frame.shape[-1] not in (3, 4):
+        raise ValueError(f"Unexpected rendered frame shape: {frame.shape}")
+    if frame.shape[-1] == 4:
+        frame = frame[..., :3]
+    return frame
+
+
+def run_episode(env, policy, device, seed: int, render: bool = True, record_path=None):
+    """Run one episode and return results dict."""
+    MAX_RESET_RETRIES = 100
+
+    # Reset with initial-success guard
+    reset_attempts = 0
+    while True:
+        obs, info = env.reset(seed=seed + reset_attempts * 1000)
+        init_success = _bool(info.get("success", False))
+        reset_attempts += 1
+        if not init_success:
+            break
+        if reset_attempts >= MAX_RESET_RETRIES:
+            break
+
+    # Move obs to device
+    if isinstance(obs, np.ndarray):
+        obs = torch.from_numpy(obs).float().to(device)
+    elif obs.device != device:
+        obs = obs.to(device)
+
+    frames = []
+    if record_path is not None:
+        frames.append(_frame_to_uint8(env.render()))
+
+    ep_reward = 0.0
+    ep_length = 0
+    done = False
+    terminated = False
+    truncated = False
+    last_info = {}
+
+    while not done:
+        with torch.no_grad():
+            action, _, _ = policy.get_action(obs, deterministic=True)
+
+        # Ensure batch dim for env.step
+        action_np = action.cpu().numpy()
+        if action_np.ndim == 1:
+            action_np = action_np.reshape(1, -1)
+
+        obs, reward, term, trunc, info = env.step(action_np)
+        last_info = info
+        done = bool(_bool(term) or _bool(trunc))
+        terminated = _bool(term)
+        truncated = _bool(trunc)
+        ep_reward += float(_scalar(reward))
+        ep_length += 1
+
+        if record_path is not None:
+            frames.append(_frame_to_uint8(env.render()))
+
+        if isinstance(obs, np.ndarray):
+            obs = torch.from_numpy(obs).float().to(device)
+        elif obs.device != device:
+            obs = obs.to(device)
+
+    if record_path is not None:
+        import imageio.v2 as imageio
+        record_path = Path(record_path)
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        imageio.mimsave(record_path, frames, fps=20, macro_block_size=None)
+
+    success = _bool(last_info.get("success", False))
+    is_grasped = _bool(last_info.get("is_grasped", False))
+    is_robot_static = _bool(last_info.get("is_robot_static", False))
+
+    return {
+        "seed": seed,
+        "success": success,
+        "steps": ep_length,
+        "terminated": terminated,
+        "truncated": truncated,
+        "episode_return": ep_reward,
+        "grasped_at_end": is_grasped,
+        "static_at_end": is_robot_static,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Render/evaluate a PPO policy on PickCube")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to checkpoint .pt file")
+    parser.add_argument("--device", type=str, default=None,
+                        help="Device (cuda/cpu/mps). Default: auto-detect.")
+    parser.add_argument("--episodes", type=int, default=1,
+                        help="Number of episodes (used when --seeds is not provided)")
+    parser.add_argument("--base-seed", type=int, default=0,
+                        help="Base seed for episodes (used when --seeds is not provided)")
+    parser.add_argument("--seeds", type=str, default=None,
+                        help="Comma-separated list of fixed seeds, "
+                             "e.g. 0,1,2,...,19. Each episode calls "
+                             "env.reset(seed=seed).")
+    parser.add_argument("--no-render", action="store_true",
+                        help="Disable GUI rendering (headless eval)")
+    parser.add_argument("--record", action="store_true",
+                        help="Record video instead of interactive render")
+    parser.add_argument("--record-dir", type=str, default="videos",
+                        help="Directory for recorded videos")
     return parser.parse_args()
 
 
-def is_done(terminated: Any, truncated: Any) -> bool:
-    return bool(
-        np.asarray(terminated).any()
-        or np.asarray(truncated).any()
-    )
-
-
-def extract_rms(rms: Any) -> tuple[np.ndarray, np.ndarray, float] | None:
-    if rms is None:
-        return None
-
-    if isinstance(rms, dict):
-        mean = rms.get("mean")
-        var = rms.get("var")
-        count = rms.get("count", 1.0)
-    else:
-        mean = getattr(rms, "mean", None)
-        var = getattr(rms, "var", None)
-        count = getattr(rms, "count", 1.0)
-
-    if mean is None or var is None:
-        return None
-
-    mean_array = np.asarray(mean, dtype=np.float32)
-    var_array = np.asarray(var, dtype=np.float32)
-    return mean_array, var_array, float(count)
-
-
-def normalize_observation(
-    obs: torch.Tensor,
-    obs_rms: tuple[np.ndarray, np.ndarray, float] | None,
-    epsilon: float = 1e-8,
-    clip_value: float = 10.0,
-) -> torch.Tensor:
-    if obs_rms is None:
-        return obs
-
-    mean, var, _ = obs_rms
-    mean_tensor = torch.as_tensor(mean, dtype=torch.float32, device=obs.device)
-    var_tensor = torch.as_tensor(var, dtype=torch.float32, device=obs.device)
-
-    normalized = (obs - mean_tensor) / torch.sqrt(var_tensor + epsilon)
-    return torch.clamp(normalized, -clip_value, clip_value)
-
-
-def main() -> None:
+def main():
     args = parse_args()
 
-    if args.episodes < 1:
-        raise ValueError("--episodes 必须大于或等于 1")
-
-    checkpoint_path = Path(args.checkpoint).expanduser().resolve()
-    output_dir = Path(args.output_dir).expanduser().resolve()
-
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"找不到 checkpoint：{checkpoint_path}")
-
-    print(f"加载 checkpoint：{checkpoint_path}")
-
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=False,
-    )
-
-    architecture = checkpoint["architecture"]
-
-    policy = PPOPolicy(
-        obs_dim=int(architecture["obs_dim"]),
-        act_dim=int(architecture["act_dim"]),
-        policy_hidden_sizes=list(architecture["policy_hidden_sizes"]),
-        value_hidden_sizes=list(architecture["value_hidden_sizes"]),
-        action_low=np.asarray(architecture["action_low"], dtype=np.float32),
-        action_high=np.asarray(architecture["action_high"], dtype=np.float32),
-    )
-
-    policy.load_state_dict(checkpoint["policy_state_dict"], strict=True)
-    policy.eval()
-
-    obs_rms = extract_rms(checkpoint.get("obs_rms"))
-
-    if obs_rms is None:
-        print("未检测到可用的 obs_rms，将使用原始观测。")
+    # --- Device ---
+    if args.device:
+        device = torch.device(args.device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
     else:
-        print("已加载观测归一化统计量。")
+        device = torch.device("cpu")
+    print(f"Device: {device}")
 
-    env_id = checkpoint.get("env_id", "PickCube-v1")
-    obs_mode = checkpoint.get("obs_mode", "state")
-    control_mode = checkpoint.get("control_mode", "pd_joint_delta_pos")
+    # --- Checkpoint ---
+    ckpt_path = Path(args.checkpoint)
+    if not ckpt_path.exists():
+        print(f"ERROR: Checkpoint not found: {ckpt_path}")
+        sys.exit(1)
 
-    print(f"环境：{env_id}")
-    print(f"观测模式：{obs_mode}")
-    print(f"控制模式：{control_mode}")
-    print(f"训练步数：{checkpoint.get('timestep')}")
-    print(f"视频目录：{output_dir}")
+    print(f"Loading checkpoint: {ckpt_path}")
+    policy, ckpt = load_policy(str(ckpt_path), device)
+    print(f"  Env ID:      {ckpt['env_id']}")
+    print(f"  Obs mode:    {ckpt['obs_mode']}")
+    print(f"  Control:     {ckpt['control_mode']}")
+    print(f"  Timestep:    {ckpt['timestep']}")
+    print(f"  Obs dim:     {policy.obs_dim}")
+    print(f"  Act dim:     {policy.act_dim}")
 
-    base_env = gym.make(
-        env_id,
-        obs_mode=obs_mode,
-        control_mode=control_mode,
-        render_mode="rgb_array",
-        sim_backend="physx_cpu",
-        max_episode_steps=args.max_steps,
-    )
+    # --- Seeds ---
+    # --record is an off-screen operation; do not open an interactive viewer.
+    render = not args.no_render and not args.record
+    if args.seeds:
+        seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
+    else:
+        seeds = [args.base_seed + i for i in range(args.episodes)]
+    print(f"Seeds ({len(seeds)}): {seeds[:5]}...{seeds[-3:]}"
+          if len(seeds) > 8 else f"Seeds: {seeds}")
 
-    env = RecordEpisode(
-        base_env,
-        output_dir=str(output_dir),
-        save_trajectory=False,
-        save_video=True,
-        save_on_reset=True,
-        max_steps_per_video=args.max_steps,
-        clean_on_close=True,
-        avoid_overwriting_video=True,
-    )
+    # --- Environment ---
+    print(f"Creating environment (render={render})...")
+    env = create_env(ckpt, render=render, record=args.record)
 
-    successes = 0
+    if args.record:
+        from pathlib import Path as P
+        record_dir = P(args.record_dir)
+        record_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        env.action_space.seed(args.seed)
+    # --- Run episodes ---
+    results = []
+    t_start = time.time()
 
-        for episode in range(args.episodes):
-            obs, info = env.reset(seed=args.seed + episode)
+    for ep_idx, seed in enumerate(seeds):
+        print(f"\n{'=' * 60}")
+        print(f"Episode {ep_idx + 1}/{len(seeds)} — seed={seed}")
 
-            episode_reward = 0.0
-            success = False
-            steps = 0
+        record_path = None
+        if args.record:
+            record_path = record_dir / f"seed_{seed}.mp4"
 
-            while steps < args.max_steps:
-                if not isinstance(obs, torch.Tensor):
-                    obs_tensor = torch.as_tensor(obs, dtype=torch.float32)
-                else:
-                    obs_tensor = obs.detach().to(
-                        device="cpu",
-                        dtype=torch.float32,
-                    )
+        result = run_episode(
+            env, policy, device, seed, render=render, record_path=record_path
+        )
+        results.append(result)
 
-                if obs_tensor.ndim == 1:
-                    obs_tensor = obs_tensor.unsqueeze(0)
+        status = "✓ SUCCESS" if result["success"] else (
+            "✗ TIMEOUT" if result["truncated"] else "✗ FAILED")
+        print(f"  {status}  steps={result['steps']}  "
+              f"return={result['episode_return']:.3f}  "
+              f"grasped={result['grasped_at_end']}  "
+              f"static={result['static_at_end']}")
+        if record_path is not None:
+            print(f"  Video: {record_path}")
 
-                normalized_obs = normalize_observation(obs_tensor, obs_rms)
+    total_time = time.time() - t_start
 
-                action_tensor = policy.deterministic_action(normalized_obs)
-                action = action_tensor.squeeze(0).cpu().numpy().astype(np.float32)
+    # --- Summary ---
+    n = len(results)
+    n_success = sum(1 for r in results if r["success"])
+    n_timeout = sum(1 for r in results if r["truncated"])
+    returns = np.array([r["episode_return"] for r in results])
+    steps = np.array([r["steps"] for r in results])
+    success_steps = np.array([r["steps"] for r in results if r["success"]])
 
-                obs, reward, terminated, truncated, info = env.step(action)
+    print(f"\n{'=' * 60}")
+    print(f"Summary ({n} episodes, {total_time:.1f}s)")
+    print(f"{'=' * 60}")
+    print(f"  Success:  {n_success}/{n} ({n_success/n*100:.1f}%)")
+    print(f"  Timeout:  {n_timeout}/{n} ({n_timeout/n*100:.1f}%)")
+    print(f"  Mean return:        {returns.mean():.3f}")
+    print(f"  Median return:      {np.median(returns):.3f}")
+    print(f"  Mean steps:         {steps.mean():.1f}")
+    print(f"  Median steps:       {np.median(steps):.1f}")
+    if len(success_steps) > 0:
+        print(f"  Mean success steps: {success_steps.mean():.1f}")
+        print(f"  Median succ steps:  {np.median(success_steps):.1f}")
 
-                # --- Stage 5.5 目标区域诊断 ---
-                unwrapped = env.unwrapped
-
-                cube_pos = unwrapped.cube.pose.p
-                goal_pos = unwrapped.goal_site.pose.p
-
-                # 单环境渲染，统一取第一个环境
-                cube_pos_np = np.asarray(
-                    cube_pos.detach().cpu() if hasattr(cube_pos, "detach") else cube_pos
-                ).reshape(-1, 3)[0]
-                goal_pos_np = np.asarray(
-                    goal_pos.detach().cpu() if hasattr(goal_pos, "detach") else goal_pos
-                ).reshape(-1, 3)[0]
-
-                goal_dist = float(np.linalg.norm(cube_pos_np - goal_pos_np))
-                goal_thresh = float(getattr(unwrapped, "goal_thresh", 0.025))
-
-                placed_geom = goal_dist <= goal_thresh
-                near_goal_geom = goal_dist <= 0.05
-
-                info_placed = info.get("is_obj_placed", None)
-                info_static = info.get("is_robot_static", None)
-                info_success = info.get("success", None)
-
-                def _as_bool(value):
-                    if value is None:
-                        return None
-                    if hasattr(value, "detach"):
-                        value = value.detach().cpu().numpy()
-                    return bool(np.asarray(value).reshape(-1)[0])
-
-                placed_info = _as_bool(info_placed)
-                static_info = _as_bool(info_static)
-                success_info = _as_bool(info_success)
-
-                if (
-                    near_goal_geom
-                    or placed_geom
-                    or placed_info
-                    or success_info
-                    or steps % 10 == 0
-                ):
-                    print(
-                        f"[目标诊断] step={steps:03d} "
-                        f"dist={goal_dist:.4f}m "
-                        f"threshold={goal_thresh:.4f}m "
-                        f"near5cm={near_goal_geom} "
-                        f"placed_geom={placed_geom} "
-                        f"placed_info={placed_info} "
-                        f"static={static_info} "
-                        f"success={success_info}"
-                    )
-
-                episode_reward += float(np.asarray(reward).mean())
-                steps += 1
-
-                if isinstance(info, dict):
-                    success_value = info.get("success", False)
-                    success = success or bool(np.asarray(success_value).any())
-
-                if is_done(terminated, truncated):
-                    break
-
-            successes += int(success)
-
-            print(
-                f"episode {episode + 1}/{args.episodes} | "
-                f"steps={steps} | "
-                f"reward={episode_reward:.3f} | "
-                f"success={success}"
-            )
-
-    finally:
-        env.close()
-
-    print()
-    print(f"渲染完成，成功率：{successes}/{args.episodes}")
-    print(f"视频已保存到：{output_dir}")
+    env.close()
+    print("\nDone.")
 
 
 if __name__ == "__main__":

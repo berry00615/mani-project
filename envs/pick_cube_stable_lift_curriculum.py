@@ -120,11 +120,18 @@ class PickCubeStableLiftCurriculumEnv(PickCubeLiftCurriculumEnv):
         # The parent already set cube and goal poses.  We check each
         # newly-reset env and resample the goal if the distance is
         # too small.  We only modify env_idx envs.
+        #
+        # IMPORTANT: during partial (auto-)reset, env_idx may have fewer
+        # elements than num_envs.  We MUST operate only on the env_idx
+        # subset and pass poses of shape (b_all, ...) to set_pose(),
+        # where b_all = len(env_idx).  The PhysX scene context is scoped
+        # to env_idx, so full-batch poses cause shape mismatches.
+        b_all = len(env_idx)
         max_retries = 20
         for _ in range(max_retries):
-            cube_pos = self.cube.pose.p[env_idx]       # (n_reset, 3)
-            goal_pos = self.goal_site.pose.p[env_idx]   # (n_reset, 3)
-            dist = torch.linalg.norm(goal_pos - cube_pos, dim=-1)  # (n_reset,)
+            cube_pos = self.cube.pose.p[env_idx]       # (b_all, 3)
+            goal_pos = self.goal_site.pose.p[env_idx]   # (b_all, 3)
+            dist = torch.linalg.norm(goal_pos - cube_pos, dim=-1)  # (b_all,)
             too_close = dist < self._min_initial_goal_distance
 
             if not too_close.any():
@@ -133,30 +140,36 @@ class PickCubeStableLiftCurriculumEnv(PickCubeLiftCurriculumEnv):
             # Count invalid initial states (only for envs still too close)
             self._invalid_initial_count += int(too_close.sum().item())
 
-            # Resample goal for too-close envs
-            fix_idx = env_idx[too_close]  # subset that needs fixing
-            b = len(fix_idx)
-            if b == 0:
+            # Local indices of too-close envs within the env_idx batch
+            local_fix = torch.where(too_close)[0]  # indices 0..b_all-1
+            bf = len(local_fix)
+            if bf == 0:
                 break
 
-            goal_xyz = torch.zeros((b, 3), device=device)
-            goal_xyz[:, :2] = (
-                torch.rand((b, 2), device=device)
+            # Build new goal positions for the too-close envs (bf, 3)
+            new_goal_xyz = torch.zeros((bf, 3), device=device)
+            new_goal_xyz[:, :2] = (
+                torch.rand((bf, 2), device=device)
                 * self.cube_spawn_half_size * 2
                 - self.cube_spawn_half_size
             )
-            goal_xyz[:, 0] += self.cube_spawn_center[0]
-            goal_xyz[:, 1] += self.cube_spawn_center[1]
-            goal_xyz[:, 2] = (
-                torch.rand((b,), device=device) * self.max_goal_height
-                + self.cube.pose.p[fix_idx, 2]
+            new_goal_xyz[:, 0] += self.cube_spawn_center[0]
+            new_goal_xyz[:, 1] += self.cube_spawn_center[1]
+            # Use the global-indexed cube z for the too-close envs
+            fix_global = env_idx[too_close]  # global indices, shape (bf,)
+            new_goal_xyz[:, 2] = (
+                torch.rand((bf,), device=device) * self.max_goal_height
+                + self.cube.pose.p[fix_global, 2]
             )
-            # Update goal position for these specific envs
-            current_goal = self.goal_site.pose.raw_pose.clone()
-            current_goal[fix_idx, :3] = goal_xyz
-            self.goal_site.set_pose(Pose.create_from_pq(
-                current_goal[:, :3], current_goal[:, 3:]
-            ))
+
+            # Read current goal poses ONLY for the env_idx batch (b_all, ...)
+            # and update the too-close entries in-place before writing back.
+            goal_pos_all = self.goal_site.pose.p[env_idx].clone()   # (b_all, 3)
+            goal_q_all   = self.goal_site.pose.q[env_idx].clone()   # (b_all, 4)
+            goal_pos_all[local_fix] = new_goal_xyz
+
+            # Write back only the env_idx batch — NEVER the full num_envs batch
+            self.goal_site.set_pose(Pose.create_from_pq(goal_pos_all, goal_q_all))
 
     # ------------------------------------------------------------------
     # Stable grasp logic

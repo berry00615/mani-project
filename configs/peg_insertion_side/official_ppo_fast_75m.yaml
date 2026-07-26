@@ -1,0 +1,20 @@
+experiment_id: PIS-O1
+source_commit: a4a4f9272ad64b1564035874b605ceb687b63ed8
+env_id: PegInsertionSide-v1
+obs_mode: state
+control_mode: pd_joint_delta_pos
+reward_mode: normalized_dense
+sim_backend: physx_cuda
+physical_gpu: 1
+seed: 0
+num_envs: 2048
+num_steps: 16
+update_epochs: 8
+num_minibatches: 32
+gamma: 0.97
+gae_lambda: 0.95
+total_timesteps: 75000000
+num_eval_steps: 100
+num_eval_envs: 16
+checkpoint_policy: preserve_all_periodic_and_final
+
